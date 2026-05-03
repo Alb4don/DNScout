@@ -50,9 +50,17 @@ import ipaddress
 import re
 import random
 import threading
+import json
+import hashlib
+import struct
+import hmac
+import csv
+import io
+import datetime
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from enum import Enum
+from collections import defaultdict
 
 import dns.resolver
 import dns.exception
@@ -85,7 +93,7 @@ from rich.markup import escape
 console = Console()
 
 TOOL_NAME = "DNScout"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "2.0"
 TOOL_TAGLINE = "Intelligent DNS Benchmarking & Network Analysis"
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -104,6 +112,61 @@ CONSISTENCY_EXCELLENT = 0.15
 CONSISTENCY_GOOD = 0.35
 CORRELATION_DNS_WEIGHT = 0.70
 CORRELATION_PING_WEIGHT = 0.30
+
+_MAX_SERVER_NAME_LEN = 64
+_MAX_DOMAIN_LEN = 253
+_MAX_IP_LEN = 45
+_MAX_USER_INPUT_LEN = 512
+_ALLOWED_IP_CHARS = frozenset("0123456789abcdefABCDEF:.")
+_ALLOWED_DOMAIN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+_MAX_CUSTOM_SERVERS = 20
+_MAX_CUSTOM_DOMAINS = 50
+_RATE_LIMIT_WINDOW = 60
+_RATE_LIMIT_MAX = 500
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_counts: Dict[str, List[float]] = defaultdict(list)
+
+
+class _InputValidationError(ValueError):
+    pass
+
+
+class _RateLimitError(RuntimeError):
+    pass
+
+
+def _rate_limit_check(key: str) -> None:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        timestamps = _rate_limit_counts[key]
+        cutoff = now - _RATE_LIMIT_WINDOW
+        _rate_limit_counts[key] = [t for t in timestamps if t > cutoff]
+        if len(_rate_limit_counts[key]) >= _RATE_LIMIT_MAX:
+            raise _RateLimitError(f"Rate limit exceeded for key: {key[:16]}")
+        _rate_limit_counts[key].append(now)
+
+
+def _sanitize_string(value: str, max_len: int, allowed_chars: frozenset, label: str) -> str:
+    if not isinstance(value, str):
+        raise _InputValidationError(f"{label} must be a string")
+    if len(value) > max_len:
+        raise _InputValidationError(f"{label} exceeds maximum length {max_len}")
+    illegal = set(value) - allowed_chars
+    if illegal:
+        safe_chars = "".join(sorted(illegal))[:20]
+        raise _InputValidationError(f"{label} contains illegal characters")
+    return value.strip()
+
+
+def _safe_float(value: Any, label: str = "value") -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise _InputValidationError(f"Cannot convert {label} to float")
+    if not (0.0 <= result <= 1_000_000.0):
+        raise _InputValidationError(f"{label} out of safe range")
+    return result
 
 
 class ServerCategory(Enum):
@@ -133,12 +196,29 @@ class DNSServer:
     category: ServerCategory
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or len(self.name) == 0:
+            raise ValueError("Server name must be a non-empty string")
+        if len(self.name) > _MAX_SERVER_NAME_LEN:
+            raise ValueError(f"Server name too long: {len(self.name)}")
+        if not isinstance(self.ip, str) or len(self.ip) == 0:
+            raise ValueError("Server IP must be a non-empty string")
+        if len(self.ip) > _MAX_IP_LEN:
+            raise ValueError(f"IP address too long: {len(self.ip)}")
         try:
             addr = ipaddress.ip_address(self.ip)
             if isinstance(addr, ipaddress.IPv6Address) != self.is_ipv6:
                 raise ValueError(f"IP/IPv6 flag mismatch for server {self.name}")
+            if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+                raise ValueError(f"Disallowed IP address type for server {self.name}")
+            if isinstance(addr, ipaddress.IPv4Address) and addr.is_private:
+                if not _is_explicitly_allowed_private(str(addr)):
+                    raise ValueError(f"Private IP not in allowlist for server {self.name}")
         except ValueError as exc:
-            raise ValueError(f"Invalid IP address '{self.ip}' for server {self.name}: {exc}") from exc
+            raise ValueError(f"Invalid IP address '{self.ip[:40]}' for server {self.name}: {exc}") from exc
+
+
+def _is_explicitly_allowed_private(ip: str) -> bool:
+    return False
 
 
 @dataclass
@@ -146,6 +226,13 @@ class MeasurementSample:
     value_ms: float
     domain: str
     success: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value_ms, (int, float)):
+            object.__setattr__(self, 'value_ms', 0.0)
+        if not (0.0 <= float(self.value_ms) <= 60_000.0):
+            object.__setattr__(self, 'value_ms', 0.0)
+            object.__setattr__(self, 'success', False)
 
 
 @dataclass
@@ -163,6 +250,16 @@ class ServerResult:
     anomaly_flags: List[str] = field(default_factory=list)
     is_global_anomaly: bool = False
     z_score: Optional[float] = None
+    percentile_rank: Optional[float] = None
+    jitter_ms: Optional[float] = None
+    min_ms: Optional[float] = None
+    max_ms: Optional[float] = None
+    median_ms: Optional[float] = None
+    dnssec_supported: Optional[bool] = None
+    response_integrity: bool = True
+    ttl_consistency: Optional[float] = None
+    cache_efficiency: Optional[float] = None
+    locality_score: Optional[float] = None
 
 
 DNS_SERVERS_IPV4: Dict[str, Tuple[str, ServerCategory]] = {
@@ -295,8 +392,25 @@ TEST_DOMAINS = [
     "cloudflare.com", "github.com", "netflix.com",
 ]
 
+_KNOWN_GOOD_RESOLUTIONS: Dict[str, frozenset] = {
+    "google.com": frozenset(["142.250.", "172.217.", "216.58.", "142.251.", "64.233."]),
+    "cloudflare.com": frozenset(["104.16.", "104.17.", "104.18.", "104.19."]),
+    "github.com": frozenset(["140.82.", "192.30.", "185.199."]),
+}
+
+_BLOCKED_RESOLUTION_MARKERS = frozenset([
+    "0.0.0.0", "127.0.0.1", "::1", "192.0.2.", "198.51.100.", "203.0.113.",
+])
+
 
 def _validate_ip(ip: str) -> bool:
+    if not isinstance(ip, str):
+        return False
+    if len(ip) > _MAX_IP_LEN:
+        return False
+    illegal = set(ip) - _ALLOWED_IP_CHARS
+    if illegal:
+        return False
     try:
         ipaddress.ip_address(ip)
         return True
@@ -305,14 +419,123 @@ def _validate_ip(ip: str) -> bool:
 
 
 def _validate_domain(domain: str) -> bool:
+    if not isinstance(domain, str):
+        return False
+    if len(domain) > _MAX_DOMAIN_LEN or len(domain) == 0:
+        return False
+    illegal = set(domain) - _ALLOWED_DOMAIN_CHARS
+    if illegal:
+        return False
     pattern = re.compile(
         r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
     )
-    return bool(pattern.match(domain)) and len(domain) <= 253
+    if not pattern.match(domain):
+        return False
+    parts = domain.split(".")
+    if any(len(p) > 63 for p in parts):
+        return False
+    if domain.startswith("-") or domain.endswith("-"):
+        return False
+    return True
 
 
 def _sanitize_server_name(name: str) -> str:
-    return re.sub(r"[^\w\-.]", "_", name)[:64]
+    if not isinstance(name, str):
+        return "unknown"
+    sanitized = re.sub(r"[^\w\-.]", "_", name)
+    return sanitized[:_MAX_SERVER_NAME_LEN]
+
+
+def _sanitize_output_string(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.replace("\x00", "").replace("\r", "").replace("\n", " ")
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", value)
+    return value[:256]
+
+
+def _check_resolution_integrity(resolved_ips: List[str], domain: str) -> bool:
+    if not resolved_ips:
+        return True
+    for ip_str in resolved_ips:
+        if not isinstance(ip_str, str):
+            continue
+        for marker in _BLOCKED_RESOLUTION_MARKERS:
+            if ip_str.startswith(marker):
+                return False
+    if domain in _KNOWN_GOOD_RESOLUTIONS:
+        prefixes = _KNOWN_GOOD_RESOLUTIONS[domain]
+        for ip_str in resolved_ips:
+            for prefix in prefixes:
+                if ip_str.startswith(prefix):
+                    return True
+        return False
+    return True
+
+
+def _compute_mad(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    med = statistics.median(values)
+    deviations = [abs(v - med) for v in values]
+    return statistics.median(deviations) if deviations else 0.0
+
+
+def _modified_z_scores(values: List[float]) -> List[float]:
+    if len(values) < 2:
+        return [0.0] * len(values)
+    med = statistics.median(values)
+    mad = _compute_mad(values)
+    if mad == 0.0:
+        stdev = statistics.stdev(values) if len(values) > 1 else 1.0
+        if stdev == 0.0:
+            return [0.0] * len(values)
+        return [0.6745 * (v - med) / stdev for v in values]
+    return [0.6745 * (v - med) / mad for v in values]
+
+
+def _grubbs_test(values: List[float]) -> List[bool]:
+    n = len(values)
+    if n < 7:
+        return [False] * n
+    mean = statistics.mean(values)
+    try:
+        stdev = statistics.stdev(values)
+    except statistics.StatisticsError:
+        return [False] * n
+    if stdev == 0:
+        return [False] * n
+    g_scores = [abs(v - mean) / stdev for v in values]
+    import math
+    critical_approx = (n - 1) / math.sqrt(n) * math.sqrt(
+        (2.776 ** 2) / (n - 2 + 2.776 ** 2)
+    )
+    return [g > critical_approx for g in g_scores]
+
+
+def _ensemble_anomaly_score(values: List[float]) -> List[float]:
+    if len(values) < 2:
+        return [0.0] * len(values)
+
+    n = len(values)
+    scores = [0.0] * n
+
+    z_scores = _compute_z_scores(values)
+    for i, z in enumerate(z_scores):
+        if abs(z) > 2.0:
+            scores[i] += min(abs(z) / Z_SCORE_ANOMALY_THRESHOLD, 1.0) * 0.4
+
+    mod_z = _modified_z_scores(values)
+    for i, mz in enumerate(mod_z):
+        if abs(mz) > 3.5:
+            scores[i] += min(abs(mz) / 5.0, 1.0) * 0.4
+
+    grubbs = _grubbs_test(values)
+    for i, is_outlier in enumerate(grubbs):
+        if is_outlier:
+            scores[i] += 0.2
+
+    return scores
 
 
 def _build_server_list(
@@ -353,9 +576,20 @@ def _check_ipv6_connectivity() -> bool:
     return False
 
 
-def _measure_dns_query(server_ip: str, domain: str, is_ipv6: bool) -> Optional[float]:
+def _measure_dns_query_extended(
+    server_ip: str, domain: str, is_ipv6: bool
+) -> Tuple[Optional[float], List[str], Optional[int]]:
     if not _validate_domain(domain):
-        return None
+        return None, [], None
+    if not _validate_ip(server_ip):
+        return None, [], None
+    try:
+        _rate_limit_check(f"dns_{server_ip}")
+    except _RateLimitError:
+        return None, [], None
+
+    resolved_ips: List[str] = []
+    ttl_value: Optional[int] = None
     try:
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = [server_ip]
@@ -363,19 +597,69 @@ def _measure_dns_query(server_ip: str, domain: str, is_ipv6: bool) -> Optional[f
         resolver.lifetime = DNS_TIMEOUT
 
         start = time.perf_counter()
-        resolver.resolve(domain, "A", raise_on_no_answer=False)
+        answer = resolver.resolve(domain, "A", raise_on_no_answer=False)
         elapsed = (time.perf_counter() - start) * 1000.0
-        return round(elapsed, 2)
+
+        if answer and hasattr(answer, 'rrset') and answer.rrset is not None:
+            for rdata in answer.rrset:
+                ip_str = str(rdata)
+                if _validate_ip(ip_str):
+                    resolved_ips.append(ip_str)
+            if answer.rrset.ttl is not None:
+                raw_ttl = int(answer.rrset.ttl)
+                if 0 <= raw_ttl <= 2_147_483_647:
+                    ttl_value = raw_ttl
+
+        if elapsed < 0 or elapsed > 60_000:
+            return None, [], None
+
+        return round(elapsed, 2), resolved_ips, ttl_value
     except dns.exception.Timeout:
-        return None
+        return None, [], None
     except dns.exception.DNSException:
+        return None, [], None
+    except (OverflowError, struct.error):
+        return None, [], None
+    except Exception:
+        return None, [], None
+
+
+def _measure_dns_query(server_ip: str, domain: str, is_ipv6: bool) -> Optional[float]:
+    ms, _, _ = _measure_dns_query_extended(server_ip, domain, is_ipv6)
+    return ms
+
+
+def _check_dnssec(server_ip: str) -> Optional[bool]:
+    if not _validate_ip(server_ip):
         return None
+    try:
+        _rate_limit_check(f"dnssec_{server_ip}")
+    except _RateLimitError:
+        return None
+    try:
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [server_ip]
+        resolver.timeout = DNS_TIMEOUT
+        resolver.lifetime = DNS_TIMEOUT
+        resolver.use_edns(0, dns.flags.DO, 1232)
+        answer = resolver.resolve("dnssec-failed.org", "A", raise_on_no_answer=False)
+        if answer and hasattr(answer, 'response') and answer.response is not None:
+            return bool(answer.response.flags & dns.flags.AD)
+        return False
+    except dns.resolver.NXDOMAIN:
+        return True
+    except dns.exception.DNSException:
+        return False
     except Exception:
         return None
 
 
 def _measure_ping(ip: str, is_ipv6: bool) -> Optional[float]:
     if not _validate_ip(ip):
+        return None
+    try:
+        _rate_limit_check(f"ping_{ip}")
+    except _RateLimitError:
         return None
     try:
         if IS_WINDOWS:
@@ -391,21 +675,25 @@ def _measure_ping(ip: str, is_ipv6: bool) -> Optional[float]:
             timeout=PING_TIMEOUT * 5,
         )
 
-        output = result.stdout
+        output = _sanitize_output_string(result.stdout)
 
         if IS_WINDOWS:
             match = re.search(r"Average\s*=\s*(\d+)\s*ms", output, re.IGNORECASE)
             if not match:
                 match = re.search(r"M\xe9dia\s*=\s*(\d+)\s*ms", output, re.IGNORECASE)
             if match:
-                return float(match.group(1))
+                val = float(match.group(1))
+                if 0.0 <= val <= 60_000.0:
+                    return val
         else:
             match = re.search(
                 r"rtt\s+min/avg/max/(?:mdev|stddev)\s*=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+",
                 output,
             )
             if match:
-                return float(match.group(1))
+                val = float(match.group(1))
+                if 0.0 <= val <= 60_000.0:
+                    return val
 
         return None
     except subprocess.TimeoutExpired:
@@ -439,14 +727,52 @@ def _compute_z_scores(values: List[float]) -> List[float]:
 
 
 def _compute_reliability_index(success_rate: float, avg_ms: float) -> float:
+    if not (0.0 <= success_rate <= 1.0):
+        success_rate = max(0.0, min(1.0, success_rate))
+    if not (0.0 <= avg_ms <= 60_000.0):
+        return 0.0
     speed_score = max(0.0, 1.0 - (avg_ms / 1000.0))
     return round(success_rate * speed_score * 100.0, 2)
 
 
 def _compute_composite_score(dns_ms: float, ping_ms: float) -> float:
+    if not (0.0 <= dns_ms <= 60_000.0 and 0.0 <= ping_ms <= 60_000.0):
+        return 999_999.0
     return round(
         dns_ms * CORRELATION_DNS_WEIGHT + ping_ms * CORRELATION_PING_WEIGHT, 2
     )
+
+
+def _compute_percentile_rank(value: float, all_values: List[float]) -> float:
+    if not all_values:
+        return 50.0
+    below = sum(1 for v in all_values if v < value)
+    equal = sum(1 for v in all_values if v == value)
+    n = len(all_values)
+    return round((below + 0.5 * equal) / n * 100.0, 1)
+
+
+def _compute_ttl_consistency(ttl_samples: List[int]) -> Optional[float]:
+    if len(ttl_samples) < 2:
+        return None
+    unique = len(set(ttl_samples))
+    return round(1.0 - (unique - 1) / len(ttl_samples), 4)
+
+
+def _compute_cache_efficiency(ttl_value: Optional[int], avg_ms: float) -> Optional[float]:
+    if ttl_value is None or avg_ms <= 0:
+        return None
+    ttl_clamped = min(ttl_value, 86400)
+    if avg_ms < 10:
+        cache_hint = 1.0
+    elif avg_ms < 30:
+        cache_hint = 0.8
+    elif avg_ms < 100:
+        cache_hint = 0.5
+    else:
+        cache_hint = 0.2
+    ttl_score = min(1.0, ttl_clamped / 3600.0)
+    return round((cache_hint * 0.6 + ttl_score * 0.4), 4)
 
 
 def _test_server(server: DNSServer) -> ServerResult:
@@ -454,9 +780,22 @@ def _test_server(server: DNSServer) -> ServerResult:
     domains = TEST_DOMAINS.copy()
     random.shuffle(domains)
 
+    ttl_samples: List[int] = []
+    resolved_ips_all: List[str] = []
+    integrity_failures = 0
+
     for i in range(TEST_COUNT):
         domain = domains[i % len(domains)]
-        ms = _measure_dns_query(server.ip, domain, server.is_ipv6)
+        ms, resolved_ips, ttl = _measure_dns_query_extended(server.ip, domain, server.is_ipv6)
+
+        if resolved_ips:
+            resolved_ips_all.extend(resolved_ips)
+            if not _check_resolution_integrity(resolved_ips, domain):
+                integrity_failures += 1
+
+        if ttl is not None:
+            ttl_samples.append(ttl)
+
         sample = MeasurementSample(
             value_ms=ms if ms is not None else 0.0,
             domain=domain,
@@ -464,13 +803,19 @@ def _test_server(server: DNSServer) -> ServerResult:
         )
         result.samples.append(sample)
 
+    result.response_integrity = integrity_failures == 0
+
     successful = [s.value_ms for s in result.samples if s.success]
-    result.success_rate = len(successful) / len(result.samples)
+    result.success_rate = len(successful) / max(len(result.samples), 1)
 
     if len(successful) >= MIN_VALID_SAMPLES:
         result.raw_avg = round(statistics.mean(successful), 2)
         filtered = _iqr_filter(successful)
         result.filtered_avg = round(statistics.mean(filtered), 2)
+        result.min_ms = round(min(filtered), 2)
+        result.max_ms = round(max(filtered), 2)
+        result.median_ms = round(statistics.median(filtered), 2)
+        result.jitter_ms = round(result.max_ms - result.min_ms, 2)
 
         if len(filtered) >= 2:
             result.std_dev = round(statistics.stdev(filtered), 2)
@@ -492,6 +837,17 @@ def _test_server(server: DNSServer) -> ServerResult:
         if result.cv_score is not None and result.cv_score > 0.5:
             result.anomaly_flags.append("HIGH_VARIANCE")
 
+        if result.jitter_ms is not None and result.jitter_ms > 200:
+            result.anomaly_flags.append("HIGH_JITTER")
+
+        if not result.response_integrity:
+            result.anomaly_flags.append("INTEGRITY_FAIL")
+
+        if ttl_samples:
+            result.ttl_consistency = _compute_ttl_consistency(ttl_samples)
+            avg_ttl = sum(ttl_samples) / len(ttl_samples)
+            result.cache_efficiency = _compute_cache_efficiency(int(avg_ttl), result.filtered_avg)
+
     return result
 
 
@@ -500,12 +856,41 @@ def _detect_global_anomalies(results: List[ServerResult]) -> None:
     if len(valid) < 3:
         return
     avgs = [r.filtered_avg for r in valid]
+
+    ensemble_scores = _ensemble_anomaly_score(avgs)
     z_scores = _compute_z_scores(avgs)
-    for result, z in zip(valid, z_scores):
+
+    all_avgs_sorted = sorted(avgs)
+    for result, z, ens_score in zip(valid, z_scores, ensemble_scores):
         result.z_score = round(z, 3)
-        if abs(z) > Z_SCORE_ANOMALY_THRESHOLD:
+        result.percentile_rank = _compute_percentile_rank(result.filtered_avg, all_avgs_sorted)
+
+        is_anomaly = (abs(z) > Z_SCORE_ANOMALY_THRESHOLD) or (ens_score > 0.7)
+        if is_anomaly:
             result.is_global_anomaly = True
-            result.anomaly_flags.append("GLOBAL_ANOMALY")
+            if "GLOBAL_ANOMALY" not in result.anomaly_flags:
+                result.anomaly_flags.append("GLOBAL_ANOMALY")
+
+
+def _check_dnssec_batch(results: List[ServerResult]) -> None:
+    valid = [r for r in results if r.filtered_avg is not None]
+    if not valid:
+        return
+
+    lock = threading.Lock()
+
+    def _worker(result: ServerResult) -> None:
+        supported = _check_dnssec(result.server.ip)
+        with lock:
+            result.dnssec_supported = supported
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DNS_WORKERS) as executor:
+        futures = {executor.submit(_worker, r): r for r in valid}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
 
 
 def _run_dns_phase(
@@ -608,6 +993,51 @@ def _run_ping_phase(results: List[ServerResult]) -> None:
                     )
 
 
+def _run_dnssec_phase(results: List[ServerResult]) -> None:
+    valid = [r for r in results if r.filtered_avg is not None]
+    if not valid:
+        return
+
+    with Progress(
+        SpinnerColumn(style="bold yellow"),
+        TextColumn("[bold white]{task.description}"),
+        BarColumn(bar_width=40, style="yellow", complete_style="green"),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        refresh_per_second=10,
+    ) as progress:
+        task = progress.add_task(
+            f"[yellow]Checking DNSSEC on {len(valid)} servers...", total=len(valid)
+        )
+        lock = threading.Lock()
+
+        def _worker(result: ServerResult) -> None:
+            supported = _check_dnssec(result.server.ip)
+            with lock:
+                result.dnssec_supported = supported
+                label = (
+                    "[green]✓[/green]"
+                    if supported
+                    else "[red]✗[/red]" if supported is False
+                    else "[dim]?[/dim]"
+                )
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"[yellow]DNSSEC [bold]{escape(result.server.name)}[/bold] → {label}",
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DNS_WORKERS) as executor:
+            futures = {executor.submit(_worker, r): r for r in valid}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    with lock:
+                        progress.update(task, advance=1)
+
+
 def _speed_color(ms: Optional[float]) -> str:
     if ms is None:
         return "red"
@@ -642,6 +1072,7 @@ def _render_dns_table(
     results: List[ServerResult],
     title: str,
     is_ipv6: bool,
+    show_extended: bool = False,
 ) -> Table:
     filtered = [r for r in results if r.server.is_ipv6 == is_ipv6]
     filtered.sort(key=lambda r: (r.filtered_avg if r.filtered_avg is not None else float("inf")))
@@ -661,8 +1092,12 @@ def _render_dns_table(
     table.add_column("IP Address", style="dim white", min_width=20)
     table.add_column("Category", min_width=16)
     table.add_column("Avg DNS (ms)", justify="right", min_width=12)
+    table.add_column("Median (ms)", justify="right", min_width=11)
+    table.add_column("Jitter (ms)", justify="right", min_width=11)
     table.add_column("Success", justify="center", width=9)
     table.add_column("Consistency", justify="center", width=11)
+    table.add_column("DNSSEC", justify="center", width=8)
+    table.add_column("Pct", justify="right", width=7)
     table.add_column("Flags", min_width=10)
 
     for rank, r in enumerate(passed, 1):
@@ -671,14 +1106,29 @@ def _render_dns_table(
         flag_text = ",".join(r.anomaly_flags) if r.anomaly_flags else "—"
         flag_style = "red" if r.anomaly_flags else "dim"
         anomaly_marker = " ⚠" if r.is_global_anomaly else ""
+        dnssec_display = (
+            "[green]✓[/green]" if r.dnssec_supported
+            else "[red]✗[/red]" if r.dnssec_supported is False
+            else "[dim]?[/dim]"
+        )
+        jitter_color = _speed_color(r.jitter_ms) if r.jitter_ms is not None else "dim"
+        jitter_str = f"[{jitter_color}]{r.jitter_ms:.1f}[/{jitter_color}]" if r.jitter_ms is not None else "—"
+        median_str = f"{r.median_ms:.1f}" if r.median_ms is not None else "—"
+        pct_str = f"{r.percentile_rank:.0f}" if r.percentile_rank is not None else "—"
+        integrity_marker = " ⛔" if not r.response_integrity else ""
+
         table.add_row(
             str(rank),
-            f"{escape(r.server.name)}{anomaly_marker}",
+            f"{escape(r.server.name)}{anomaly_marker}{integrity_marker}",
             escape(r.server.ip),
             f"[{cat_color}]{r.server.category.value}[/{cat_color}]",
             f"[{color}]{r.filtered_avg:.1f}[/{color}]",
+            median_str,
+            jitter_str,
             f"[green]{r.success_rate * 100:.0f}%[/green]",
             f"[{'green' if r.cv_score and r.cv_score <= CONSISTENCY_EXCELLENT else 'yellow'}]{_consistency_label(r.cv_score)}[/{'green' if r.cv_score and r.cv_score <= CONSISTENCY_EXCELLENT else 'yellow'}]",
+            dnssec_display,
+            pct_str,
             f"[{flag_style}]{escape(flag_text)}[/{flag_style}]",
         )
 
@@ -689,7 +1139,11 @@ def _render_dns_table(
             escape(r.server.ip),
             r.server.category.value,
             "[red]FAILED[/red]",
+            "—",
+            "—",
             f"[red]{r.success_rate * 100:.0f}%[/red]",
+            "—",
+            "[dim]?[/dim]",
             "—",
             "[red]UNREACHABLE[/red]",
         )
@@ -726,6 +1180,7 @@ def _render_correlation_table(
     table.add_column("Diff (ms)", justify="right", width=10)
     table.add_column("Score", justify="right", width=10)
     table.add_column("Reliability", justify="right", width=11)
+    table.add_column("Cache Eff.", justify="right", width=10)
 
     for rank, r in enumerate(filtered, 1):
         dns_color = _speed_color(r.filtered_avg)
@@ -739,6 +1194,7 @@ def _render_correlation_table(
         diff_str = f"{diff:+.1f}" if diff is not None else "—"
         diff_color = "green" if diff is not None and abs(diff) < 30 else "yellow" if diff is not None and abs(diff) < 100 else "red"
         rel_str = f"{r.reliability_index:.1f}" if r.reliability_index is not None else "—"
+        cache_str = f"{r.cache_efficiency:.2f}" if r.cache_efficiency is not None else "—"
 
         table.add_row(
             str(rank),
@@ -749,9 +1205,154 @@ def _render_correlation_table(
             f"[{diff_color}]{diff_str}[/{diff_color}]",
             f"[{score_color}]{r.composite_score:.1f}[/{score_color}]",
             f"[cyan]{rel_str}[/cyan]",
+            f"[dim]{cache_str}[/dim]",
         )
 
     return table
+
+
+def _render_security_table(
+    results: List[ServerResult],
+    title: str,
+    is_ipv6: bool,
+) -> Table:
+    filtered = [
+        r for r in results
+        if r.server.is_ipv6 == is_ipv6 and r.filtered_avg is not None
+    ]
+    filtered.sort(key=lambda r: (
+        0 if r.dnssec_supported else 1,
+        r.filtered_avg if r.filtered_avg is not None else float("inf")
+    ))
+
+    table = Table(
+        title=title,
+        box=rich_box.ROUNDED,
+        border_style="red",
+        header_style="bold white",
+        show_lines=True,
+        expand=True,
+    )
+    table.add_column("Server Name", style="white", min_width=28)
+    table.add_column("IP Address", style="dim white", min_width=20)
+    table.add_column("Category", min_width=16)
+    table.add_column("DNSSEC", justify="center", width=10)
+    table.add_column("Integrity", justify="center", width=11)
+    table.add_column("TTL Consistency", justify="center", width=16)
+    table.add_column("Anomaly Flags", min_width=20)
+
+    for r in filtered:
+        cat_color = CATEGORY_COLORS.get(r.server.category, "white")
+        dnssec_str = (
+            "[green]Validated[/green]" if r.dnssec_supported
+            else "[red]None[/red]" if r.dnssec_supported is False
+            else "[dim]Unknown[/dim]"
+        )
+        integrity_str = "[green]OK[/green]" if r.response_integrity else "[red]FAIL[/red]"
+        ttl_str = f"{r.ttl_consistency:.2f}" if r.ttl_consistency is not None else "—"
+        flags_str = escape(",".join(r.anomaly_flags)) if r.anomaly_flags else "[dim]—[/dim]"
+
+        table.add_row(
+            escape(r.server.name),
+            escape(r.server.ip),
+            f"[{cat_color}]{r.server.category.value}[/{cat_color}]",
+            dnssec_str,
+            integrity_str,
+            ttl_str,
+            flags_str,
+        )
+
+    return table
+
+
+def _export_results_json(results: List[ServerResult], path: str) -> bool:
+    try:
+        safe_path = os.path.realpath(path)
+        if not safe_path.endswith(".json"):
+            return False
+        allowed_base = os.path.realpath(os.path.expanduser("~"))
+        if not safe_path.startswith(allowed_base):
+            return False
+
+        output: List[Dict[str, Any]] = []
+        for r in results:
+            entry: Dict[str, Any] = {
+                "name": _sanitize_output_string(r.server.name),
+                "ip": _sanitize_output_string(r.server.ip),
+                "is_ipv6": bool(r.server.is_ipv6),
+                "category": _sanitize_output_string(r.server.category.value),
+                "filtered_avg_ms": r.filtered_avg,
+                "raw_avg_ms": r.raw_avg,
+                "median_ms": r.median_ms,
+                "min_ms": r.min_ms,
+                "max_ms": r.max_ms,
+                "jitter_ms": r.jitter_ms,
+                "std_dev": r.std_dev,
+                "cv_score": r.cv_score,
+                "success_rate": r.success_rate,
+                "reliability_index": r.reliability_index,
+                "ping_ms": r.ping_ms,
+                "composite_score": r.composite_score,
+                "dnssec_supported": r.dnssec_supported,
+                "response_integrity": r.response_integrity,
+                "ttl_consistency": r.ttl_consistency,
+                "cache_efficiency": r.cache_efficiency,
+                "percentile_rank": r.percentile_rank,
+                "z_score": r.z_score,
+                "is_global_anomaly": r.is_global_anomaly,
+                "anomaly_flags": [_sanitize_output_string(f) for f in r.anomaly_flags],
+            }
+            output.append(entry)
+
+        with open(safe_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=True)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _export_results_csv(results: List[ServerResult], path: str) -> bool:
+    try:
+        safe_path = os.path.realpath(path)
+        if not safe_path.endswith(".csv"):
+            return False
+        allowed_base = os.path.realpath(os.path.expanduser("~"))
+        if not safe_path.startswith(allowed_base):
+            return False
+
+        fieldnames = [
+            "name", "ip", "is_ipv6", "category", "filtered_avg_ms", "median_ms",
+            "jitter_ms", "success_rate", "reliability_index", "ping_ms",
+            "composite_score", "dnssec_supported", "response_integrity",
+            "percentile_rank", "z_score", "is_global_anomaly", "anomaly_flags"
+        ]
+
+        with open(safe_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in results:
+                writer.writerow({
+                    "name": _sanitize_output_string(r.server.name),
+                    "ip": _sanitize_output_string(r.server.ip),
+                    "is_ipv6": r.server.is_ipv6,
+                    "category": _sanitize_output_string(r.server.category.value),
+                    "filtered_avg_ms": r.filtered_avg,
+                    "median_ms": r.median_ms,
+                    "jitter_ms": r.jitter_ms,
+                    "success_rate": round(r.success_rate * 100, 1) if r.success_rate is not None else None,
+                    "reliability_index": r.reliability_index,
+                    "ping_ms": r.ping_ms,
+                    "composite_score": r.composite_score,
+                    "dnssec_supported": r.dnssec_supported,
+                    "response_integrity": r.response_integrity,
+                    "percentile_rank": r.percentile_rank,
+                    "z_score": r.z_score,
+                    "is_global_anomaly": r.is_global_anomaly,
+                    "anomaly_flags": "|".join(r.anomaly_flags),
+                })
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _display_banner() -> None:
@@ -772,22 +1373,6 @@ def _display_banner() -> None:
         "bright_magenta",
         "magenta",
     ]
-
-    art_text = Text()
-    for line, color in zip(art_lines, gradient_colors):
-        art_text.append(line + "\n", style=f"bold {color}")
-
-    subtitle = Text(justify="center")
-    subtitle.append("  ⚡ ", style="bold yellow")
-    subtitle.append(TOOL_TAGLINE, style="bold white")
-    subtitle.append("  ⚡", style="bold yellow")
-
-    version_text = Text(justify="center")
-    version_text.append(f"  v{TOOL_VERSION}  ", style="dim white")
-    version_text.append("│", style="dim white")
-    version_text.append(f"  Python {sys.version.split()[0]}  ", style="dim white")
-    version_text.append("│", style="dim white")
-    version_text.append(f"  {platform.system()} {platform.machine()}  ", style="dim white")
 
     panel_content = Text(justify="center")
     for line, color in zip(art_lines, gradient_colors):
@@ -821,7 +1406,11 @@ def _display_legend() -> None:
     )
     console.print(
         "  [bold cyan]Reliability Index[/bold cyan] = Success Rate × Speed Score (0–100, higher is better)    "
-        "[bold red]⚠ = Statistical Anomaly (Z > 2.5σ)[/bold red]"
+        "[bold red]⚠ = Statistical Anomaly (Z > 2.5σ)[/bold red]    "
+        "[bold red]⛔ = Integrity Failure[/bold red]"
+    )
+    console.print(
+        "  [bold yellow]Ensemble Anomaly Detection[/bold yellow]: Z-Score + Modified Z-Score (MAD) + Grubbs Test"
     )
     console.print()
 
@@ -835,6 +1424,8 @@ def _display_summary(results: List[ServerResult], has_ipv6: bool) -> None:
     ipv4_passed = [r for r in passed if not r.server.is_ipv6]
     ipv6_passed = [r for r in passed if r.server.is_ipv6]
     anomalies = [r for r in results if r.is_global_anomaly]
+    integrity_fails = [r for r in results if not r.response_integrity]
+    dnssec_ok = [r for r in passed if r.dnssec_supported is True]
 
     summary = Table(box=rich_box.SIMPLE, show_header=False, expand=False)
     summary.add_column("", style="dim white")
@@ -846,6 +1437,8 @@ def _display_summary(results: List[ServerResult], has_ipv6: bool) -> None:
         summary.add_row("Responding (IPv6)", f"[blue]{len(ipv6_passed)}[/blue]")
     summary.add_row("Failed / Unreachable", f"[red]{len(failed)}[/red]")
     summary.add_row("Statistical Anomalies Detected", f"[yellow]{len(anomalies)}[/yellow]")
+    summary.add_row("Response Integrity Failures", f"[red]{len(integrity_fails)}[/red]")
+    summary.add_row("DNSSEC-Validating Servers", f"[green]{len(dnssec_ok)}[/green]")
     console.print(summary)
     console.print()
 
@@ -858,6 +1451,14 @@ def _display_top_picks(results: List[ServerResult], has_ipv6: bool) -> None:
         if not valid:
             return None
         return min(valid, key=lambda r: getattr(r, key))
+
+    def _best_secure(pool: List[ServerResult]) -> Optional[ServerResult]:
+        valid = [r for r in pool if r.filtered_avg is not None and r.dnssec_supported and r.response_integrity]
+        if not valid:
+            valid = [r for r in pool if r.filtered_avg is not None and r.response_integrity]
+        if not valid:
+            return None
+        return min(valid, key=lambda r: r.filtered_avg)
 
     ipv4_results = [r for r in results if not r.server.is_ipv6]
     ipv6_results = [r for r in results if r.server.is_ipv6]
@@ -881,7 +1482,11 @@ def _display_top_picks(results: List[ServerResult], has_ipv6: bool) -> None:
         if best is None:
             continue
         val = getattr(best, attr)
+        if val is None:
+            continue
         color = _speed_color(val) if unit == "ms" else "cyan"
+        integrity_note = " [red]⛔[/red]" if not best.response_integrity else ""
+        dnssec_note = " [green](DNSSEC)[/green]" if best.dnssec_supported else ""
         console.print(
             f"  {label}:  [bold white]{escape(best.server.name)}[/bold white]"
             f"  [dim]({escape(best.server.ip)})[/dim]"
@@ -891,14 +1496,22 @@ def _display_top_picks(results: List[ServerResult], has_ipv6: bool) -> None:
                 if best.ping_ms is not None
                 else ""
             )
+            + dnssec_note + integrity_note
         )
 
     console.print()
 
+    best_secure_ipv4 = _best_secure(ipv4_results)
     best_two_ipv4 = sorted(
-        [r for r in ipv4_results if r.filtered_avg is not None],
+        [r for r in ipv4_results if r.filtered_avg is not None and r.response_integrity],
         key=lambda r: r.filtered_avg,
     )[:2]
+
+    if not best_two_ipv4:
+        best_two_ipv4 = sorted(
+            [r for r in ipv4_results if r.filtered_avg is not None],
+            key=lambda r: r.filtered_avg,
+        )[:2]
 
     if best_two_ipv4:
         console.print(Rule("[bold white]⚙  Configuration Recommendation[/bold white]", style="green"))
@@ -920,33 +1533,78 @@ def _display_top_picks(results: List[ServerResult], has_ipv6: bool) -> None:
 def _prompt_confirm(message: str) -> bool:
     try:
         response = console.input(f"[bold yellow]? [/bold yellow][white]{message}[/white] [dim](y/N):[/dim] ").strip().lower()
+        if len(response) > 10:
+            return False
         return response in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
 
 
-def _interactive_menu() -> Dict[str, bool]:
+def _safe_input(prompt: str, max_len: int = _MAX_USER_INPUT_LEN) -> str:
+    try:
+        raw = console.input(prompt).strip()
+        if len(raw) > max_len:
+            return raw[:max_len]
+        return raw
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def _interactive_menu() -> Dict[str, Any]:
     console.print(Rule("[bold white]Configuration[/bold white]", style="dim cyan"))
-    opts: Dict[str, bool] = {}
+    opts: Dict[str, Any] = {}
 
     console.print("  [bold cyan]DNScout[/bold cyan] will test all known public DNS servers for your network.\n")
 
     try:
         console.print("  [bold]Options:[/bold]")
-        include_ipv6_input = console.input(
+        include_ipv6_input = _safe_input(
             "  [yellow]► Include IPv6 DNS servers?[/yellow] [dim](requires IPv6 connectivity)[/dim] [dim](y/N):[/dim] "
-        ).strip().lower()
+        ).lower()
         opts["want_ipv6"] = include_ipv6_input in ("y", "yes")
 
-        run_ping_input = console.input(
+        run_ping_input = _safe_input(
             "  [yellow]► Run DNS-Ping correlation analysis?[/yellow] [dim](adds ~30s)[/dim] [dim](Y/n):[/dim] "
-        ).strip().lower()
+        ).lower()
         opts["run_ping"] = run_ping_input not in ("n", "no")
+
+        run_dnssec_input = _safe_input(
+            "  [yellow]► Run DNSSEC validation check?[/yellow] [dim](adds ~20s)[/dim] [dim](Y/n):[/dim] "
+        ).lower()
+        opts["run_dnssec"] = run_dnssec_input not in ("n", "no")
+
+        run_security_report_input = _safe_input(
+            "  [yellow]► Show security analysis report?[/yellow] [dim](Y/n):[/dim] "
+        ).lower()
+        opts["show_security"] = run_security_report_input not in ("n", "no")
+
+        export_input = _safe_input(
+            "  [yellow]► Export results?[/yellow] [dim](json/csv/no)[/dim] [dim](no):[/dim] "
+        ).lower()
+        if export_input in ("json", "csv"):
+            opts["export_format"] = export_input
+            default_name = f"dnscout_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.{export_input}"
+            path_input = _safe_input(
+                f"  [yellow]► Export path[/yellow] [dim](default: {default_name}):[/dim] "
+            )
+            if not path_input:
+                path_input = default_name
+            path_clean = re.sub(r"[^\w\-_./]", "_", path_input)[:120]
+            if not path_clean.endswith(f".{export_input}"):
+                path_clean = path_clean + f".{export_input}"
+            opts["export_path"] = path_clean
+        else:
+            opts["export_format"] = None
+            opts["export_path"] = None
 
         console.print()
     except (EOFError, KeyboardInterrupt):
         opts.setdefault("want_ipv6", False)
         opts.setdefault("run_ping", True)
+        opts.setdefault("run_dnssec", False)
+        opts.setdefault("show_security", False)
+        opts.setdefault("export_format", None)
+        opts.setdefault("export_path", None)
 
     return opts
 
@@ -957,6 +1615,10 @@ def main() -> None:
 
     want_ipv6 = opts.get("want_ipv6", False)
     run_ping = opts.get("run_ping", True)
+    run_dnssec = opts.get("run_dnssec", False)
+    show_security = opts.get("show_security", False)
+    export_format = opts.get("export_format")
+    export_path = opts.get("export_path")
 
     has_ipv6 = False
     if want_ipv6:
@@ -971,6 +1633,12 @@ def main() -> None:
     ipv4_count = sum(1 for s in servers if not s.is_ipv6)
     ipv6_count = sum(1 for s in servers if s.is_ipv6)
 
+    feature_list = "IQR Filtering + Ensemble Anomaly (Z-Score+MAD+Grubbs) + Reliability Indexing"
+    if run_dnssec:
+        feature_list += " + DNSSEC Validation"
+    if show_security:
+        feature_list += " + Security Report"
+
     console.print(
         Panel(
             f"[white]Servers:[/white] [bold cyan]{len(servers)}[/bold cyan]  "
@@ -979,7 +1647,7 @@ def main() -> None:
             f"[dim]across {len(TEST_DOMAINS)} domains[/dim]\n"
             f"[white]Total queries:[/white] [bold cyan]{len(servers) * TEST_COUNT}[/bold cyan]\n"
             f"[white]Concurrency:[/white] [bold cyan]{MAX_DNS_WORKERS}[/bold cyan] workers\n"
-            f"[white]AI Analysis:[/white] [bold green]IQR Filtering + Z-Score Anomaly Detection + Reliability Indexing[/bold green]",
+            f"[white]Analysis:[/white] [bold green]{feature_list}[/bold green]",
             title="[bold white]Test Parameters[/bold white]",
             border_style="cyan",
         )
@@ -992,7 +1660,7 @@ def main() -> None:
     results = _run_dns_phase(servers)
 
     console.print()
-    console.print("[cyan]Running AI-powered analysis...[/cyan]")
+    console.print("[cyan]Running ensemble anomaly detection...[/cyan]")
     _detect_global_anomalies(results)
     console.print("[green]✓ Anomaly detection complete[/green]\n")
 
@@ -1000,6 +1668,12 @@ def main() -> None:
         console.print(Rule("[bold white]Phase 2 — DNS-Ping Correlation Analysis[/bold white]", style="magenta"))
         console.print()
         _run_ping_phase(results)
+        console.print()
+
+    if run_dnssec:
+        console.print(Rule("[bold white]Phase 3 — DNSSEC Validation[/bold white]", style="yellow"))
+        console.print()
+        _run_dnssec_phase(results)
         console.print()
 
     console.print(Rule("[bold white]Results — IPv4 DNS Servers[/bold white]", style="cyan"))
@@ -1025,9 +1699,36 @@ def main() -> None:
             console.print(ipv6_corr)
             console.print()
 
+    if show_security:
+        console.print(Rule("[bold white]Security Analysis — IPv4[/bold white]", style="red"))
+        sec_table = _render_security_table(results, "IPv4 Security Assessment", is_ipv6=False)
+        console.print(sec_table)
+        console.print()
+
+        if has_ipv6:
+            console.print(Rule("[bold white]Security Analysis — IPv6[/bold white]", style="red"))
+            sec_table_v6 = _render_security_table(results, "IPv6 Security Assessment", is_ipv6=True)
+            console.print(sec_table_v6)
+            console.print()
+
     _display_legend()
     _display_summary(results, has_ipv6)
     _display_top_picks(results, has_ipv6)
+
+    if export_format and export_path:
+        console.print(Rule("[bold white]Export[/bold white]", style="green"))
+        if export_format == "json":
+            ok = _export_results_json(results, export_path)
+        elif export_format == "csv":
+            ok = _export_results_csv(results, export_path)
+        else:
+            ok = False
+
+        if ok:
+            console.print(f"  [green]✓ Results exported to:[/green] [white]{escape(export_path)}[/white]")
+        else:
+            console.print(f"  [red]✗ Export failed. Check path and permissions.[/red]")
+        console.print()
 
     console.print(Rule(style="dim white"))
     console.print(
@@ -1044,5 +1745,5 @@ if __name__ == "__main__":
         console.print("\n[yellow]Interrupted by user. Goodbye.[/yellow]")
         sys.exit(0)
     except Exception as exc:
-        console.print(f"\n[red]Fatal error:[/red] {escape(str(exc))}")
+        console.print(f"\n[red]An error occurred. Please check your environment and try again.[/red]")
         sys.exit(1)
